@@ -1,0 +1,255 @@
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from google.colab import files
+np.random.seed(42)
+# Parameters (from your code)
+params = {
+    'Pi_H': 100, 'Pi_V': 3000,
+    'eta1': 1.4, 'eta2': 28,
+    'mu_H': 1/(65*365), 'mu_V': 100/365,
+    'phi1': 73/365, 'phi2': 73/365,
+    'gamma1': 52/365, 'gamma2': 52/365,
+    'delta1': 0.18/365, 'delta2': 0.18/365,
+    'deltaV1': 0, 'deltaV2': 0,
+    'w1': 12/365, 'w2': 12/365,
+    'alphaV1': 1000/365, 'alphaV2': 800/365,
+    'alphaH1': 10/365, 'alphaH2': 10/365,
+    'waning': 0.005,  # waning immunity rate
+    'u1': 0.6, 'u2': 0.3, 'epsilon': 0.8,
+    'W': 500  # Weight for control cost
+}
+
+# Initial conditions (18 compartments)
+y0 = [1e3, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e2, 1e4, 1e2, 1e2, 1e2]
+
+# Time grid
+T = 100
+t_span = (0, T)
+t_eval = np.linspace(0, T, 10000)
+
+# State equations (forward)
+def state_equations(t, y, phi):
+    S, E1, I1, R1, C1, E12, I12, E2, I2, R2, C2, E21, I21, R, Sv, VI1, VI2, VH = y
+
+    NH = S + E1 + I1 + R1 + C1 + E12 + I12 + E2 + I2 + R2 + C2 + E21 + I21 + R + Sv + VI1 + VI2 + VH
+    phi_val = phi(t)
+    if not np.isscalar(phi_val):
+        phi_val = phi_val[0]
+    lambdaV1 = params['alphaV1'] * VI1 / NH
+    lambdaV2 = params['alphaV2'] * VI2 / NH
+    lambdaH1 = params['alphaH1'] * (I1 + params['eta1'] * I21) / NH
+    lambdaH2 = params['alphaH2'] * (I2 + params['eta2'] * I12) / NH
+
+    dS = params['Pi_H'] - (lambdaV1 + lambdaV2) * S - phi_val * S + params['waning'] * VH - params['mu_H'] * S
+    dE1 = lambdaV1 * S - (params['phi1'] + params['mu_H']) * E1 + (1-params['epsilon']) * lambdaV1 * VH
+    dE2 = lambdaV2 * S - (params['phi2'] + params['mu_H']) * E2 + (1-params['epsilon']) * lambdaV2 * VH
+    dI1 = params['phi1'] * E1 - (params['gamma1'] + params['delta1'] + params['mu_H']) * I1
+    dI2 = params['phi2'] * E2 - (params['gamma2'] + params['delta2'] + params['mu_H']) * I2
+    dR1 = params['gamma1'] * I1 - (params['w1'] + params['mu_H']) * R1
+    dR2 = params['gamma2'] * I2 - (params['w2'] + params['mu_H']) * R2
+    dC1 = params['w1'] * R1 - (params['u1'] * lambdaV2 + (1 - params['u1']) + params['mu_H']) * C1
+    dC2 = params['w2'] * R2 - (params['u2'] * lambdaV1 + (1 - params['u2']) + params['mu_H']) * C2
+    dE21 = params['u2'] * lambdaV1 * C2 - (params['phi1'] + params['mu_H']) * E21
+    dE12 = params['u1'] * lambdaV2 * C1 - (params['phi2'] + params['mu_H']) * E12
+    dI21 = params['phi1'] * E21 - (params['gamma1'] + params['delta1'] + params['mu_H']) * I21
+    dI12 = params['phi2'] * E12 - (params['gamma2'] + params['delta2'] + params['mu_H']) * I12
+    dR = params['gamma1'] * I21 + params['gamma2'] * I12 + (1 - params['u1']) * C1 + (1 - params['u2']) * C2 - params['mu_H'] * R
+    dSv = params['Pi_V'] - (lambdaH1 + lambdaH2) * Sv - params['mu_V'] * Sv
+    dVI1 = lambdaH1 * Sv - (params['deltaV1'] + params['mu_V']) * VI1
+    dVI2 = lambdaH2 * Sv - (params['deltaV2'] + params['mu_V']) * VI2
+    dVH = phi_val * S - (1-params['epsilon']) * (lambdaV1 + lambdaV2) * VH - params['waning'] * VH - params['mu_H'] * VH
+
+    return np.array([dS, dE1, dI1, dR1, dC1, dE12, dI12, dE2, dI2, dR2, dC2, dE21, dI21, dR, dSv, dVI1, dVI2, dVH])
+
+# Adjoint equations (backward)
+def adjoint_equations(t, lambda_, y_all, phi_func):
+    y = np.array([np.interp(t, t_eval, y_all[i, :]) for i in range(y_all.shape[0])])
+    S, E1, I1, R1, C1, E12, I12, E2, I2, R2, C2, E21, I21, R, Sv, VI1, VI2, VH = y # Unpack here
+
+    NH = S + E1 + I1 + R1 + C1 + E12 + I12 + E2 + I2 + R2 + C2 + E21 + I21 + R + Sv + VI1 + VI2 + VH
+    # This line was previously before unpacking S, E1, etc. causing the error
+    # y = np.interp(t, t_eval, y_all[:, 0])
+    lambdaV1 = params['alphaV1'] * VI1 / NH
+    lambdaV2 = params['alphaV2'] * VI2 / NH
+    lambdaH1 = params['alphaH1'] * (I1 + params['eta1'] * I21) / NH
+    lambdaH2 = params['alphaH2'] * (I2 + params['eta2'] * I12) / NH
+    phi = phi_func(t)
+    l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15, l16, l17, l18 = lambda_
+
+    # Partial derivatives of the Hamiltonian w.r.t. each state
+    dH_dS = (
+        l1 * (lambdaV1 + lambdaV2 + phi + params['mu_H']) -
+        l2 * lambdaV1 -
+        l8 * lambdaV2 -
+        l18 * phi
+    )
+
+    dH_dE1 = (
+        l2 * (params['phi1'] + params['mu_H']) -
+        l3 * params['phi1']
+    )
+
+    dH_dI1 = (
+      - 1 + l3 * (params['gamma1'] + params['delta1'] + params['mu_H']) -
+        l4 * params['gamma1'] -
+        l16 * params['alphaH1'] * Sv / NH
+    )
+
+    dH_dR1 = (
+        l4 * (params['w1'] + params['mu_H']) -
+        l5 * params['w1']
+    )
+
+    dH_dC1 = (
+        l5 * (params['u1'] * lambdaV2 + (1 - params['u1']) + params['mu_H']) -
+        l6 * params['u1'] * lambdaV2 -
+        l14 * (1 - params['u1'])
+    )
+
+    dH_dE12 = (
+        l6 * (params['phi2'] + params['mu_H']) -
+        l7 * params['phi2']
+    )
+
+    dH_dI12 = (
+      - 1 + l7 * (params['gamma2'] + params['delta2'] + params['mu_H']) -
+        l14 * params['gamma2'] -
+        l17 * params['alphaH2'] * params['eta2'] * Sv / NH
+    )
+
+    dH_dE2 = (
+        l8 * (params['phi2'] + params['mu_H']) -
+        l9 * params['phi2']
+    )
+
+    dH_dI2 = (
+      - 1 +l9 * (params['gamma2'] + params['delta2'] + params['mu_H']) -
+        l10 * params['gamma2'] -
+        l17 * params['alphaH2'] * Sv / NH
+    )
+
+    dH_dR2 = (
+        l10 * (params['w2'] + params['mu_H']) -
+        l11 * params['w2']
+    )
+
+    dH_dC2 = (
+        l11 * (params['u2'] * lambdaV1 + (1 - params['u2']) + params['mu_H']) -
+        l12 * params['u2'] * lambdaV1 -
+        l14 * (1 - params['u2'])
+    )
+
+    dH_dE21 = (
+        l12 * (params['phi1'] + params['mu_H']) -
+        l13 * params['phi1']
+    )
+
+    dH_dI21 = (
+      - 1 + l13 * (params['gamma1'] + params['delta1'] + params['mu_H']) -
+        l14 * params['gamma1'] -
+        l16 * params['alphaH1'] * params['eta1'] * Sv / NH
+    )
+
+    dH_dR = l14 * params['mu_H']
+
+    dH_dSv = (
+        l15 * (lambdaH1 + lambdaH2 + params['mu_V']) -
+        l16 * lambdaH1 -
+        l17 * lambdaH2
+    )
+
+    dH_dVI1 = (
+        l16 * (params['deltaV1'] + params['mu_V']) -
+        l1 * params['alphaV1'] * S / NH -
+        l2 * (1 - params['epsilon']) * params['alphaV1'] * VH / NH
+    )
+
+    dH_dVI2 = (
+        l17 * (params['deltaV2'] + params['mu_V']) -
+        l1 * params['alphaV2'] * S / NH -
+        l8 * (1 - params['epsilon']) * params['alphaV2'] * VH / NH
+    )
+
+    dH_dVH = (
+        l18 * ((1 - params['epsilon']) * (lambdaV1 + lambdaV2) + params['waning'] + params['mu_H']) -
+        l1 * params['waning'] -
+        l2 * (1 - params['epsilon']) * lambdaV1 -
+        l8 * (1 - params['epsilon']) * lambdaV2
+    )
+
+    return np.array([
+        dH_dS, dH_dE1, dH_dI1, dH_dR1, dH_dC1, dH_dE12, dH_dI12,
+        dH_dE2, dH_dI2, dH_dR2, dH_dC2, dH_dE21, dH_dI21, dH_dR,
+        dH_dSv, dH_dVI1, dH_dVI2, dH_dVH
+    ])
+
+# Hamiltonian minimization (optimal control)
+def optimal_phi(t, y, lambda_):
+    S = y[0]
+    l1 = lambda_[0]
+    l18 = lambda_[17]
+    # Optimal control: phi(t) = max(0, min(1, (l1 - l18)*S / W))
+    return np.clip((l1 - l18) * S / params['W'], 0, 0.7)
+
+# Forward-Backward Sweep Algorithm
+def forward_backward_sweep(max_iter=1000, tol=1e-6):
+    phi_guess = lambda t: 0.5
+
+    for _ in range(max_iter):
+        sol = solve_ivp(lambda t, y: state_equations(t, y, phi_guess), t_span, y0, t_eval=t_eval)
+        y = sol.y.T
+
+        lambda_T = np.zeros(18)
+        sol_adj = solve_ivp(lambda t, l: adjoint_equations(t, l, sol.y, phi_guess),
+                            (T, 0), lambda_T, t_eval=t_eval[::-1])
+        lambda_ = sol_adj.y.T[::-1]
+
+        # Interpolators
+        y_interp_funcs = [interp1d(t_eval, sol.y[i, :], kind='cubic', bounds_error=False, fill_value="extrapolate") for i in range(18)]
+        lambda_interp_funcs = [interp1d(t_eval, lambda_[:, i], kind='cubic', bounds_error=False, fill_value="extrapolate") for i in range(18)]
+
+        phi_new = lambda t: optimal_phi(t, [f(t) for f in y_interp_funcs], [f(t) for f in lambda_interp_funcs])
+
+        # Convergence check
+        phi_old_vals = np.array([phi_guess(t) for t in t_eval])
+        phi_new_vals = np.array([phi_new(t) for t in t_eval])
+        if np.max(np.abs(phi_new_vals - phi_old_vals)) < tol:
+            break
+
+        phi_guess = phi_new
+
+    return sol, lambda_, phi_new
+
+
+# Run the algorithm
+sol, lambda_, phi_optimal = forward_backward_sweep()
+I1 = sol.y[2, :]
+I12 = sol.y[6, :]
+I2 = sol.y[8, :]
+I21 = sol.y[12, :]
+phi_vals = np.array([phi_optimal(t) for t in sol.t])
+
+integrand = I1 + I12 + I2 + I21 + (params['W'] / 2) * phi_vals**2
+
+J_phi = np.trapezoid(integrand, sol.t) # Numerical integration over time
+print(f"Value of functional J(phi): {J_phi}")
+# Plot results (similar to your deep learning output)
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(sol.t, sol.y[2] + sol.y[12], label="(I1 + I21)", color='red')
+plt.plot(sol.t, sol.y[8] + sol.y[6], label="(I2 + I12)", color='blue')
+plt.xlabel("Time/Days")
+plt.ylabel("Infected Population")
+plt.title('Total Infected Dynamics by Strains')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(sol.t, [phi_optimal(t) for t in sol.t], label="Optimal Control ϕ(t)", color='green')
+plt.xlabel("Time/Days")
+plt.ylabel('$ϕ(t)$')
+plt.title('Optimal Vaccination Control')
+plt.legend()
+plt.tight_layout()
+plt.show()
